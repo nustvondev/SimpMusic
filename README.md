@@ -247,3 +247,8 @@ This project is tested with BrowserStack
 *This project is a part of SimpMusic.org Open-source project by me [maxrave-dev](https://github.com/maxrave-dev)*
 
 <!-- GitAds-Verify: 9788276LHF131ESPL12SWLJ8LACOJE89 -->
+
+
+```
+.\gradlew :desktopApp:run
+```

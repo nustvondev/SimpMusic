@@ -9,6 +9,7 @@ import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -17,6 +18,8 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.MarqueeAnimationMode
 import androidx.compose.foundation.background
@@ -60,6 +63,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -70,6 +74,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -143,6 +150,7 @@ import com.maxrave.simpmusic.viewModel.UIEvent
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Clock
@@ -153,8 +161,10 @@ import simpmusic.composeapp.generated.resources.share_lyrics
 import simpmusic.composeapp.generated.resources.unavailable
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.time.TimeSource
+import org.koin.compose.koinInject
 
 // The gutter this sheet has always used for its lyrics column.
 private val FULLSCREEN_LYRICS_GUTTER = 50.dp
@@ -173,19 +183,22 @@ private val CHROME_VOLUME_SLIDER_WIDTH = 120.dp
 // Track-change transition tunable constants
 internal const val ARTWORK_TRANSITION_ENABLED = true
 internal const val HANDOFF_PARTICLES_ENABLED = true
-internal const val HANDOFF_SCALE = 0.65f
-internal val HANDOFF_GAP = 24.dp
-internal const val HANDOFF_ENTER_MS = 600
-internal const val TRANSITION_MS = 550
+internal const val COVER_TRANSITION_MIN_SCALE = 0.50f
+internal const val COVER_TRANSITION_MAX_SCALE = 1.00f
+internal const val COVER_TRANSITION_ALPHA_FADE_IN_END = 0.30f
+internal const val COVER_TRANSITION_ALPHA_FADE_OUT_START = 0.70f
+internal const val TRACK_TRANSITION_ROTATION_Y_DEG = 15f
+internal const val TRACK_TRANSITION_CAMERA_DISTANCE = 16f
+internal const val COVER_TRANSITION_PALETTE_TRIGGER_PROGRESS = 0.50f
+internal val HANDOFF_MIDPOINT_GAP = 56.dp
+internal const val DEFAULT_CROSSFADE_DURATION_MS = 5000
+internal const val SETTLING_DURATION_MS = 250
+internal const val CAROUSEL_DURATION_MS = 550
 internal const val PARTICLE_MAX = 24
 internal const val PARTICLE_LIFETIME_MIN_MS = 1200L
 internal const val PARTICLE_LIFETIME_MAX_MS = 1800L
-internal const val TRACK_TRANSITION_ROTATION_Y_DEG = 15f
-internal const val TRACK_TRANSITION_SCALE_OUT = 0.85f
-internal const val TRACK_TRANSITION_SCALE_IN_FROM = 0.85f
-internal const val TRACK_TRANSITION_SLIDE_FRACTION = 0.30f
-internal const val TRACK_TRANSITION_CAMERA_DISTANCE = 16f
-private val TrackTransitionEasing = FastOutSlowInEasing
+internal const val PARTICLE_SPAWN_PROGRESS_MIN = 0.08f
+internal const val PARTICLE_SPAWN_PROGRESS_MAX = 0.82f
 private val ArtworkShape = RoundedCornerShape(12.dp)
 
 internal enum class TrackTransitionDirection { Forward, Backward }
@@ -213,28 +226,87 @@ private class CoverItem(
     var url by mutableStateOf(url)
     var isCurrentTrack by mutableStateOf(isCurrentTrack)
     var isLoaded by mutableStateOf(false)
-    val translationX = androidx.compose.animation.core.Animatable(0f)
-    val scale = androidx.compose.animation.core.Animatable(1f)
-    val alpha = androidx.compose.animation.core.Animatable(1f)
-    val rotationY = androidx.compose.animation.core.Animatable(0f)
+    var bitmap by mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null)
+    var isPaletteTriggered by mutableStateOf(false)
+
+    // Layer transform values driven per frame with zero recomposition
+    val translationX = mutableFloatStateOf(0f)
+    val scale = mutableFloatStateOf(1f)
+    val alpha = mutableFloatStateOf(1f)
+    val rotationY = mutableFloatStateOf(0f)
     var targetSlot by mutableStateOf(CoverSlotTarget.CENTER)
 }
 
 internal class ArtworkLayoutMetrics(
     val slotOffsetPx: Float,
-    val effectiveHandoffScale: Float,
     val carouselSlidePx: Float,
-    val exitDistancePx: Float,
 )
 
 private class ArtworkLayoutMetricsHolder {
     var metrics: ArtworkLayoutMetrics? = null
 }
 
-private fun progressInRange(progress: Float, start: Float, end: Float): Float {
-    if (progress <= start) return 0f
-    if (progress >= end) return 1f
-    return (progress - start) / (end - start)
+private data class CoverTransform(
+    val translationX: Float,
+    val scale: Float,
+    val alpha: Float,
+    val rotationY: Float,
+)
+
+private fun mapCoverTransition(
+    progress: Float,
+    isOutgoing: Boolean,
+    direction: TrackTransitionDirection,
+    slotOffsetPx: Float,
+): CoverTransform {
+    val p = progress.coerceIn(0f, 1f)
+    val eased = FastOutSlowInEasing.transform(p)
+    val sign = if (direction == TrackTransitionDirection.Forward) 1f else -1f
+
+    return if (isOutgoing) {
+        val transX = -sign * slotOffsetPx * eased
+        val s = 1.0f - (1.0f - COVER_TRANSITION_MIN_SCALE) * eased
+        val a = if (eased <= COVER_TRANSITION_ALPHA_FADE_OUT_START) {
+            1.0f
+        } else {
+            1.0f - ((eased - COVER_TRANSITION_ALPHA_FADE_OUT_START) / (1.0f - COVER_TRANSITION_ALPHA_FADE_OUT_START))
+        }.coerceIn(0f, 1f)
+        val rotY = -sign * TRACK_TRANSITION_ROTATION_Y_DEG * eased
+        CoverTransform(transX, s, a, rotY)
+    } else {
+        val transX = sign * slotOffsetPx * (1.0f - eased)
+        val s = COVER_TRANSITION_MIN_SCALE + (1.0f - COVER_TRANSITION_MIN_SCALE) * eased
+        val a = if (eased >= COVER_TRANSITION_ALPHA_FADE_IN_END) {
+            1.0f
+        } else {
+            eased / COVER_TRANSITION_ALPHA_FADE_IN_END
+        }.coerceIn(0f, 1f)
+        val rotY = sign * TRACK_TRANSITION_ROTATION_Y_DEG * (1.0f - eased)
+        CoverTransform(transX, s, a, rotY)
+    }
+}
+
+private fun applyCoverTransform(
+    cover: CoverItem,
+    transform: CoverTransform,
+) {
+    cover.translationX.floatValue = transform.translationX
+    cover.scale.floatValue = transform.scale
+    cover.alpha.floatValue = transform.alpha
+    cover.rotationY.floatValue = transform.rotationY
+}
+
+private fun checkTriggerPalette(
+    progress: Float,
+    incomingCover: CoverItem,
+    onArtworkBitmap: (androidx.compose.ui.graphics.ImageBitmap) -> Unit,
+) {
+    if (progress >= COVER_TRANSITION_PALETTE_TRIGGER_PROGRESS && !incomingCover.isPaletteTriggered) {
+        incomingCover.bitmap?.let { bmp ->
+            incomingCover.isPaletteTriggered = true
+            onArtworkBitmap(bmp)
+        }
+    }
 }
 
 
@@ -280,9 +352,12 @@ fun FullscreenLyricsContent(
         mutableFloatStateOf(0f)
     }
 
-    // Auto-hide controls state - Only hide control buttons, not title/progress
+    // Auto-hide controls state - hidden when entering fullscreen, shown on mouse move / tap
     var showControlButtons by rememberSaveable {
-        mutableStateOf(true)
+        mutableStateOf(false)
+    }
+    var lastUserInteractionTime by remember {
+        mutableLongStateOf(0L)
     }
 
     var showNowPlayingSheet by rememberSaveable {
@@ -290,9 +365,9 @@ fun FullscreenLyricsContent(
     }
 
     // Reset auto-hide timer when controls are shown
-    LaunchedEffect(key1 = showControlButtons) {
+    LaunchedEffect(key1 = lastUserInteractionTime, key2 = showControlButtons) {
         if (showControlButtons) {
-            delay(4000) // Hide after 4 seconds
+            delay(3000) // Hide after 3 seconds of inactivity
             showControlButtons = false
         }
     }
@@ -344,6 +419,8 @@ fun FullscreenLyricsContent(
     // the render-feedback loop that crashes the RuntimeShader.
     val backdrop = rememberBackdrop(Color.Black)
 
+    var lastPointerPosition by remember { mutableStateOf<Offset?>(null) }
+
     Box(
         modifier =
             Modifier
@@ -351,12 +428,48 @@ fun FullscreenLyricsContent(
                 // The sheet host paints black under this page. The Popup host on Desktop paints
                 // nothing, and the gradient's translucent stops would let the app show through.
                 .background(Color.Black)
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            when (event.type) {
+                                PointerEventType.Move -> {
+                                    val currentPos = event.changes.firstOrNull()?.position
+                                    val lastPos = lastPointerPosition
+                                    if (currentPos != null) {
+                                        if (lastPos != null) {
+                                            val dx = currentPos.x - lastPos.x
+                                            val dy = currentPos.y - lastPos.y
+                                            // Only trigger if pointer moved more than 2 pixels (ignore synthetic zero-move events)
+                                            if (dx * dx + dy * dy > 4f) {
+                                                if (!showControlButtons) {
+                                                    showControlButtons = true
+                                                }
+                                                lastUserInteractionTime = Clock.System.now().toEpochMilliseconds()
+                                            }
+                                        }
+                                        lastPointerPosition = currentPos
+                                    }
+                                }
+                                PointerEventType.Press -> {
+                                    if (!showControlButtons) {
+                                        showControlButtons = true
+                                    }
+                                    lastUserInteractionTime = Clock.System.now().toEpochMilliseconds()
+                                }
+                            }
+                        }
+                    }
+                }
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() },
                 ) {
-                    // Show controls on tap
-                    showControlButtons = true
+                    // Toggle controls on tap/click
+                    showControlButtons = !showControlButtons
+                    if (showControlButtons) {
+                        lastUserInteractionTime = Clock.System.now().toEpochMilliseconds()
+                    }
                 },
     ) {
         if (isLandscape) {
@@ -368,14 +481,21 @@ fun FullscreenLyricsContent(
                 nowPlayingStyle = nowPlayingStyle,
                 backdrop = backdrop,
                 isCrossfading = timelineState.isCrossfading,
+                showControlButtons = showControlButtons,
             )
             if (isDesktop) {
-                FullscreenLyricsDesktopChrome(
-                    sharedViewModel = sharedViewModel,
-                    backdrop = backdrop,
-                    onDismiss = onDismiss,
+                AnimatedVisibility(
+                    visible = showControlButtons,
+                    enter = fadeIn(tween(300)) + slideInVertically(tween(350, easing = FastOutSlowInEasing)) { -it },
+                    exit = fadeOut(tween(250)) + slideOutVertically(tween(350, easing = FastOutSlowInEasing)) { -it },
                     modifier = Modifier.align(Alignment.TopCenter),
-                )
+                ) {
+                    FullscreenLyricsDesktopChrome(
+                        sharedViewModel = sharedViewModel,
+                        backdrop = backdrop,
+                        onDismiss = onDismiss,
+                    )
+                }
             }
         } else {
             // Crossfade: RGB rainbow color cycling when transitioning between tracks
@@ -895,92 +1015,6 @@ fun FullscreenLyricsContent(
  * it on the left, the lyrics on the right. Only the row and the controls come from the style — its
  * action row (info, cast, queue…) stays on the Now Playing page.
  */
-private suspend fun animateCoverToSlot(
-    cover: CoverItem,
-    target: CoverSlotTarget,
-    durationMs: Int,
-    metrics: ArtworkLayoutMetrics,
-    easing: androidx.compose.animation.core.Easing = FastOutSlowInEasing,
-) {
-    cover.targetSlot = target
-    val targetTranslationX = when (target) {
-        CoverSlotTarget.CENTER -> 0f
-        CoverSlotTarget.LEFT -> -metrics.slotOffsetPx
-        CoverSlotTarget.RIGHT -> metrics.slotOffsetPx
-        CoverSlotTarget.EXIT_LEFT -> {
-            if (cover.translationX.value < -metrics.slotOffsetPx * 0.5f) {
-                -(metrics.slotOffsetPx + metrics.exitDistancePx)
-            } else {
-                -metrics.carouselSlidePx
-            }
-        }
-        CoverSlotTarget.EXIT_RIGHT -> {
-            if (cover.translationX.value > metrics.slotOffsetPx * 0.5f) {
-                metrics.slotOffsetPx + metrics.exitDistancePx
-            } else {
-                metrics.carouselSlidePx
-            }
-        }
-    }
-
-    val targetScale = when (target) {
-        CoverSlotTarget.CENTER -> 1.0f
-        CoverSlotTarget.LEFT, CoverSlotTarget.RIGHT -> metrics.effectiveHandoffScale
-        CoverSlotTarget.EXIT_LEFT, CoverSlotTarget.EXIT_RIGHT -> {
-            if (cover.translationX.value < -metrics.slotOffsetPx * 0.5f || cover.translationX.value > metrics.slotOffsetPx * 0.5f) {
-                metrics.effectiveHandoffScale * 0.9f
-            } else {
-                TRACK_TRANSITION_SCALE_OUT
-            }
-        }
-    }
-
-    val targetAlpha = when (target) {
-        CoverSlotTarget.CENTER, CoverSlotTarget.LEFT, CoverSlotTarget.RIGHT -> 1.0f
-        CoverSlotTarget.EXIT_LEFT, CoverSlotTarget.EXIT_RIGHT -> 0f
-    }
-
-    val targetRotationY = when (target) {
-        CoverSlotTarget.CENTER -> 0f
-        CoverSlotTarget.LEFT -> -TRACK_TRANSITION_ROTATION_Y_DEG
-        CoverSlotTarget.RIGHT -> TRACK_TRANSITION_ROTATION_Y_DEG
-        CoverSlotTarget.EXIT_LEFT -> -TRACK_TRANSITION_ROTATION_Y_DEG
-        CoverSlotTarget.EXIT_RIGHT -> TRACK_TRANSITION_ROTATION_Y_DEG
-    }
-
-    coroutineScope {
-        launch {
-            cover.translationX.animateTo(
-                targetValue = targetTranslationX,
-                animationSpec = tween(durationMillis = durationMs, easing = easing),
-            )
-        }
-        launch {
-            cover.scale.animateTo(
-                targetValue = targetScale,
-                animationSpec = tween(durationMillis = durationMs, easing = easing),
-            )
-        }
-        launch {
-            cover.alpha.animateTo(
-                targetValue = targetAlpha,
-                animationSpec = tween(durationMillis = durationMs, easing = easing),
-            )
-        }
-        launch {
-            cover.rotationY.animateTo(
-                targetValue = targetRotationY,
-                animationSpec = tween(durationMillis = durationMs, easing = easing),
-            )
-        }
-    }
-}
-
-/**
- * Landscape: the artwork with the current Now Playing style's track row and playback controls under
- * it on the left, the lyrics on the right. Only the row and the controls come from the style — its
- * action row (info, cast, queue…) stays on the Now Playing page.
- */
 @Composable
 private fun FullscreenLyricsLandscape(
     sharedViewModel: SharedViewModel,
@@ -990,10 +1024,15 @@ private fun FullscreenLyricsLandscape(
     nowPlayingStyle: String,
     backdrop: PlatformBackdrop,
     isCrossfading: Boolean = false,
+    showControlButtons: Boolean = true,
 ) {
     val localDensity = LocalDensity.current
     val isDesktop = getPlatform() == Platform.Desktop
     val transitionEnabled = isDesktop && ARTWORK_TRANSITION_ENABLED
+
+    val dataStoreManager: DataStoreManager = koinInject()
+    val configuredCrossfadeDuration by dataStoreManager.crossfadeDuration.collectAsStateWithLifecycle(DEFAULT_CROSSFADE_DURATION_MS)
+    val effectiveCrossfadeMs = if (configuredCrossfadeDuration > 0) configuredCrossfadeDuration else DEFAULT_CROSSFADE_DURATION_MS
 
     // Trigger key: stable track identity (videoId, with title+artist fallback).
     val currentTrackId = state.videoId?.takeIf { it.isNotBlank() }
@@ -1001,11 +1040,15 @@ private fun FullscreenLyricsLandscape(
     val currentThumbnailUrl = state.screenData.thumbnailURL
 
     var transitionState by remember { mutableStateOf(ArtworkTransitionState.IDLE) }
+    var transitionDirection by remember { mutableStateOf(TrackTransitionDirection.Forward) }
     var displayedTrackId by remember { mutableStateOf<String?>(null) }
     var displayedArtworkUrl by remember { mutableStateOf<String?>(null) }
     var isFirstComposition by remember { mutableStateOf(true) }
     var lastOrderIndex by remember { mutableIntStateOf(state.currentOrderIndex) }
     var lastIsCrossfading by remember { mutableStateOf(isCrossfading) }
+
+    // Progress drives the continuous scale, translation, alpha, rotation (0f -> 1f)
+    val transitionProgress = remember { Animatable(0f) }
 
     // Up to 2 active covers on screen
     var activeCovers by remember { mutableStateOf<List<CoverItem>>(emptyList()) }
@@ -1014,9 +1057,43 @@ private fun FullscreenLyricsLandscape(
     var transitionJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val metricsHolder = remember { ArtworkLayoutMetricsHolder() }
     val particlePool = remember { HandoffParticlePool(PARTICLE_MAX) }
-    val isSpawningAllowed = transitionState == ArtworkTransitionState.HANDOFF
-    val shouldRunParticleLoop = transitionEnabled && HANDOFF_PARTICLES_ENABLED &&
-        (transitionState == ArtworkTransitionState.HANDOFF || (transitionState == ArtworkTransitionState.SETTLING && particlePool.activeCount > 0))
+
+    fun completeTransition(winningCover: CoverItem) {
+        activeCovers = listOf(winningCover)
+        displayedArtworkUrl = winningCover.url
+        displayedTrackId = winningCover.trackId
+        transitionState = ArtworkTransitionState.IDLE
+        particlePool.reset()
+        if (!winningCover.isPaletteTriggered) {
+            winningCover.bitmap?.let { bmp ->
+                winningCover.isPaletteTriggered = true
+                actions.onArtworkBitmap(bmp)
+            }
+        }
+        transitionScope.launch {
+            transitionProgress.snapTo(0f)
+        }
+    }
+
+    // Trigger palette callback on incoming cover once transitionProgress reaches midpoint (0.50f)
+    LaunchedEffect(activeCovers, transitionState) {
+        if (activeCovers.size >= 2 && transitionState != ArtworkTransitionState.IDLE) {
+            val incomingCover = activeCovers[1]
+            snapshotFlow { transitionProgress.value }
+                .collect { p ->
+                    if (p >= COVER_TRANSITION_PALETTE_TRIGGER_PROGRESS && !incomingCover.isPaletteTriggered) {
+                        incomingCover.bitmap?.let { bmp ->
+                            incomingCover.isPaletteTriggered = true
+                            Logger.d(
+                                "FullscreenLyrics",
+                                "[${Clock.System.now()}] [PALETTE] Dynamic color triggered at progress=$p for trackId=${incomingCover.trackId}"
+                            )
+                            actions.onArtworkBitmap(bmp)
+                        }
+                    }
+                }
+        }
+    }
 
     // Observe isCrossfading changes
     LaunchedEffect(isCrossfading) {
@@ -1030,15 +1107,7 @@ private fun FullscreenLyricsLandscape(
 
             // If crossfade just ended (true -> false) and we are currently in HANDOFF
             if (!isCrossfading && transitionState == ArtworkTransitionState.HANDOFF) {
-                val validMetrics = metricsHolder.metrics ?: ArtworkLayoutMetrics(
-                    slotOffsetPx = 400f,
-                    effectiveHandoffScale = HANDOFF_SCALE,
-                    carouselSlidePx = 300f,
-                    exitDistancePx = 300f,
-                )
-                val outgoing = activeCovers.firstOrNull { it.targetSlot == CoverSlotTarget.LEFT }
-                val incoming = activeCovers.firstOrNull { it.targetSlot == CoverSlotTarget.RIGHT }
-
+                val incoming = activeCovers.getOrNull(1)
                 if (incoming != null) {
                     val fromState = transitionState
                     transitionState = ArtworkTransitionState.SETTLING
@@ -1049,36 +1118,20 @@ private fun FullscreenLyricsLandscape(
 
                     transitionJob?.cancel()
                     transitionJob = transitionScope.launch {
-                        coroutineScope {
-                            if (outgoing != null) {
-                                launch {
-                                    animateCoverToSlot(
-                                        cover = outgoing,
-                                        target = CoverSlotTarget.EXIT_LEFT,
-                                        durationMs = TRANSITION_MS,
-                                        metrics = validMetrics,
-                                    )
-                                }
-                            }
-                            launch {
-                                animateCoverToSlot(
-                                    cover = incoming,
-                                    target = CoverSlotTarget.CENTER,
-                                    durationMs = TRANSITION_MS,
-                                    metrics = validMetrics,
-                                )
-                            }
+                        val currentP = transitionProgress.value
+                        if (currentP < 1f) {
+                            transitionProgress.animateTo(
+                                targetValue = 1f,
+                                animationSpec = tween(
+                                    durationMillis = SETTLING_DURATION_MS,
+                                    easing = FastOutSlowInEasing,
+                                ),
+                            )
                         }
-
-                        // Settling completed: outgoing cover is removed
-                        activeCovers = listOf(incoming)
-                        displayedArtworkUrl = incoming.url
-                        particlePool.reset()
-                        val finalState = transitionState
-                        transitionState = ArtworkTransitionState.IDLE
+                        completeTransition(incoming)
                         Logger.d(
                             "FullscreenLyrics",
-                            "[${Clock.System.now()}] [STATE] State transition: from=$finalState, to=IDLE, reason=Settling animation completed (trackId=${incoming.trackId})"
+                            "[${Clock.System.now()}] [STATE] Settling completed (trackId=${incoming.trackId})"
                         )
                     }
                 }
@@ -1150,25 +1203,14 @@ private fun FullscreenLyricsLandscape(
             return@LaunchedEffect
         }
 
-        var metrics = metricsHolder.metrics
-        if (metrics == null) {
-            delay(16)
-            metrics = metricsHolder.metrics
-        }
-        val validMetrics = metrics ?: ArtworkLayoutMetrics(
-            slotOffsetPx = 400f,
-            effectiveHandoffScale = HANDOFF_SCALE,
-            carouselSlidePx = 300f,
-            exitDistancePx = 300f,
-        )
-
         val delta = state.currentOrderIndex - lastOrderIndex
         val direction = if (delta == -1) TrackTransitionDirection.Backward else TrackTransitionDirection.Forward
+        transitionDirection = direction
         lastOrderIndex = state.currentOrderIndex
 
         // Check Case: Revert during HANDOFF
-        val existingOutgoing = activeCovers.firstOrNull { it.targetSlot == CoverSlotTarget.LEFT }
-        val existingIncoming = activeCovers.firstOrNull { it.targetSlot == CoverSlotTarget.RIGHT }
+        val existingOutgoing = activeCovers.getOrNull(0)
+        val existingIncoming = activeCovers.getOrNull(1)
         if (transitionState == ArtworkTransitionState.HANDOFF && existingOutgoing != null && existingOutgoing.trackId == currentTrackId) {
             val fromState = transitionState
             particlePool.reset()
@@ -1185,38 +1227,17 @@ private fun FullscreenLyricsLandscape(
 
             transitionJob?.cancel()
             transitionJob = transitionScope.launch {
-                coroutineScope {
-                    launch {
-                        animateCoverToSlot(
-                            cover = existingOutgoing,
-                            target = CoverSlotTarget.CENTER,
-                            durationMs = TRANSITION_MS,
-                            metrics = validMetrics,
-                        )
-                    }
-                    if (existingIncoming != null) {
-                        launch {
-                            animateCoverToSlot(
-                                cover = existingIncoming,
-                                target = CoverSlotTarget.EXIT_RIGHT,
-                                durationMs = TRANSITION_MS,
-                                metrics = validMetrics,
-                            )
-                        }
-                    }
-                }
-                activeCovers = listOf(existingOutgoing)
-                transitionState = ArtworkTransitionState.IDLE
-                Logger.d(
-                    "FullscreenLyrics",
-                    "[${Clock.System.now()}] [STATE] Revert animation completed (trackId=$currentTrackId)"
+                transitionProgress.animateTo(
+                    targetValue = 0f,
+                    animationSpec = tween(durationMillis = SETTLING_DURATION_MS, easing = FastOutSlowInEasing),
                 )
+                completeTransition(existingOutgoing)
             }
             return@LaunchedEffect
         }
 
-        // Check Case: Third track skip during HANDOFF or SETTLING
-        if ((transitionState == ArtworkTransitionState.HANDOFF || transitionState == ArtworkTransitionState.SETTLING)
+        // Check Case: Third track skip during HANDOFF, SETTLING, or CAROUSEL
+        if ((transitionState == ArtworkTransitionState.HANDOFF || transitionState == ArtworkTransitionState.SETTLING || transitionState == ArtworkTransitionState.CAROUSEL)
             && existingIncoming != null && currentTrackId != existingIncoming.trackId && currentTrackId != existingOutgoing?.trackId
         ) {
             val fromState = transitionState
@@ -1224,36 +1245,24 @@ private fun FullscreenLyricsLandscape(
             particlePool.reset()
             Logger.d(
                 "FullscreenLyrics",
-                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=CAROUSEL, reason=Third track skip during handoff/settling (incoming=${existingIncoming.trackId} -> new=$currentTrackId)"
+                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=CAROUSEL, reason=Third track skip during transition (incoming=${existingIncoming.trackId} -> new=$currentTrackId)"
             )
 
-            // 1. Left cover fades out quickly (~150ms)
-            if (existingOutgoing != null) {
-                transitionScope.launch {
-                    existingOutgoing.alpha.animateTo(0f, tween(150))
-                }
-            }
-
-            // 2. Right cover becomes outgoing
+            // Current incoming becomes outgoing for 3rd track
             existingIncoming.isCurrentTrack = false
 
-            // 3. New cover for 3rd track
             val newCover = CoverItem(
                 trackId = currentTrackId,
                 url = currentThumbnailUrl,
                 isCurrentTrack = true,
             )
-            val sign = if (direction == TrackTransitionDirection.Forward) 1f else -1f
-            newCover.translationX.snapTo(sign * validMetrics.carouselSlidePx)
-            newCover.scale.snapTo(TRACK_TRANSITION_SCALE_IN_FROM)
-            newCover.rotationY.snapTo(sign * TRACK_TRANSITION_ROTATION_Y_DEG)
-            newCover.alpha.snapTo(0f)
 
             activeCovers = listOf(existingIncoming, newCover)
             displayedTrackId = currentTrackId
 
             transitionJob?.cancel()
             transitionJob = transitionScope.launch {
+                transitionProgress.snapTo(0f)
                 val waitStartTime = TimeSource.Monotonic.markNow()
                 withTimeoutOrNull(300L) {
                     snapshotFlow { newCover.isLoaded }.first { it }
@@ -1264,33 +1273,11 @@ private fun FullscreenLyricsLandscape(
                     "[${Clock.System.now()}] [LOAD] Waited ${waitedMs}ms for 3rd-track cover (loaded=${newCover.isLoaded})"
                 )
 
-                val exitTarget = if (direction == TrackTransitionDirection.Forward) CoverSlotTarget.EXIT_LEFT else CoverSlotTarget.EXIT_RIGHT
-                coroutineScope {
-                    launch {
-                        animateCoverToSlot(
-                            cover = existingIncoming,
-                            target = exitTarget,
-                            durationMs = TRANSITION_MS,
-                            metrics = validMetrics,
-                        )
-                    }
-                    launch {
-                        animateCoverToSlot(
-                            cover = newCover,
-                            target = CoverSlotTarget.CENTER,
-                            durationMs = TRANSITION_MS,
-                            metrics = validMetrics,
-                        )
-                    }
-                }
-
-                activeCovers = listOf(newCover)
-                displayedArtworkUrl = currentThumbnailUrl
-                transitionState = ArtworkTransitionState.IDLE
-                Logger.d(
-                    "FullscreenLyrics",
-                    "[${Clock.System.now()}] [STATE] Third-track carousel completed (trackId=$currentTrackId)"
+                transitionProgress.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = CAROUSEL_DURATION_MS, easing = LinearEasing),
                 )
+                completeTransition(newCover)
             }
             return@LaunchedEffect
         }
@@ -1298,7 +1285,6 @@ private fun FullscreenLyricsLandscape(
         // Normal transition (HANDOFF or CAROUSEL)
         val outgoingCover = activeCovers.lastOrNull { it.isCurrentTrack } ?: activeCovers.lastOrNull()
         if (outgoingCover == null) {
-            // No outgoing URL known -> stay IDLE with single cover
             val singleCover = CoverItem(currentTrackId, currentThumbnailUrl, isCurrentTrack = true)
             activeCovers = listOf(singleCover)
             displayedTrackId = currentTrackId
@@ -1311,10 +1297,7 @@ private fun FullscreenLyricsLandscape(
             return@LaunchedEffect
         }
 
-        // Mark outgoing as no longer current
         outgoingCover.isCurrentTrack = false
-
-        // Create incoming cover
         val incomingCover = CoverItem(
             trackId = currentTrackId,
             url = currentThumbnailUrl,
@@ -1327,20 +1310,15 @@ private fun FullscreenLyricsLandscape(
             transitionState = ArtworkTransitionState.HANDOFF
             Logger.d(
                 "FullscreenLyrics",
-                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=HANDOFF, reason=Track changed with isCrossfading=true (outgoing=${outgoingCover.trackId}, incoming=$currentTrackId)"
+                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=HANDOFF, duration=${effectiveCrossfadeMs}ms (outgoing=${outgoingCover.trackId}, incoming=$currentTrackId)"
             )
-
-            // Incoming starts at right slot (invisible initially)
-            incomingCover.translationX.snapTo(validMetrics.slotOffsetPx + validMetrics.exitDistancePx * 0.5f)
-            incomingCover.scale.snapTo(validMetrics.effectiveHandoffScale)
-            incomingCover.rotationY.snapTo(TRACK_TRANSITION_ROTATION_Y_DEG)
-            incomingCover.alpha.snapTo(0f)
 
             activeCovers = listOf(outgoingCover, incomingCover)
             displayedTrackId = currentTrackId
 
             transitionJob?.cancel()
             transitionJob = transitionScope.launch {
+                transitionProgress.snapTo(0f)
                 val waitStartTime = TimeSource.Monotonic.markNow()
                 withTimeoutOrNull(300L) {
                     snapshotFlow { incomingCover.isLoaded }.first { it }
@@ -1351,27 +1329,35 @@ private fun FullscreenLyricsLandscape(
                     "[${Clock.System.now()}] [LOAD] Waited ${waitedMs}ms for handoff incoming cover (loaded=${incomingCover.isLoaded})"
                 )
 
-                coroutineScope {
-                    launch {
-                        animateCoverToSlot(
-                            cover = outgoingCover,
-                            target = CoverSlotTarget.LEFT,
-                            durationMs = HANDOFF_ENTER_MS,
-                            metrics = validMetrics,
-                        )
+                // UI-driven progress loop with pause/resume support
+                while (transitionProgress.value < 1f && isActive) {
+                    if (!state.controllerState.isPlaying) {
+                        Logger.d("FullscreenLyrics", "[PAUSE] Freezing transition at progress=${transitionProgress.value}")
+                        snapshotFlow { state.controllerState.isPlaying }.first { it }
+                        Logger.d("FullscreenLyrics", "[RESUME] Resuming transition from progress=${transitionProgress.value}")
                     }
-                    launch {
-                        animateCoverToSlot(
-                            cover = incomingCover,
-                            target = CoverSlotTarget.RIGHT,
-                            durationMs = HANDOFF_ENTER_MS,
-                            metrics = validMetrics,
-                        )
+                    val remainingProgress = (1f - transitionProgress.value).coerceAtLeast(0f)
+                    if (remainingProgress <= 0.001f) break
+                    val remainingDurationMs = (effectiveCrossfadeMs * remainingProgress).roundToInt().coerceAtLeast(16)
+
+                    coroutineScope {
+                        val animJob = launch {
+                            transitionProgress.animateTo(
+                                targetValue = 1f,
+                                animationSpec = tween(durationMillis = remainingDurationMs, easing = LinearEasing),
+                            )
+                        }
+                        val pauseJob = launch {
+                            snapshotFlow { state.controllerState.isPlaying }.first { !it }
+                            animJob.cancel()
+                        }
+                        animJob.join()
+                        pauseJob.cancel()
                     }
                 }
                 Logger.d(
                     "FullscreenLyrics",
-                    "[${Clock.System.now()}] [ANIM] Handoff enter animation completed: covers resting at LEFT and RIGHT slots"
+                    "[${Clock.System.now()}] [ANIM] Handoff progress reached 1.0 (waiting for isCrossfading -> false)"
                 )
             }
         } else {
@@ -1381,20 +1367,15 @@ private fun FullscreenLyricsLandscape(
             particlePool.reset()
             Logger.d(
                 "FullscreenLyrics",
-                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=CAROUSEL, reason=Track changed with isCrossfading=false (dir=$direction, outgoing=${outgoingCover.trackId}, incoming=$currentTrackId)"
+                "[${Clock.System.now()}] [STATE] State transition: from=$fromState, to=CAROUSEL, duration=${CAROUSEL_DURATION_MS}ms (dir=$direction, outgoing=${outgoingCover.trackId}, incoming=$currentTrackId)"
             )
-
-            val sign = if (direction == TrackTransitionDirection.Forward) 1f else -1f
-            incomingCover.translationX.snapTo(sign * validMetrics.carouselSlidePx)
-            incomingCover.scale.snapTo(TRACK_TRANSITION_SCALE_IN_FROM)
-            incomingCover.rotationY.snapTo(sign * TRACK_TRANSITION_ROTATION_Y_DEG)
-            incomingCover.alpha.snapTo(0f)
 
             activeCovers = listOf(outgoingCover, incomingCover)
             displayedTrackId = currentTrackId
 
             transitionJob?.cancel()
             transitionJob = transitionScope.launch {
+                transitionProgress.snapTo(0f)
                 val waitStartTime = TimeSource.Monotonic.markNow()
                 withTimeoutOrNull(300L) {
                     snapshotFlow { incomingCover.isLoaded }.first { it }
@@ -1405,32 +1386,14 @@ private fun FullscreenLyricsLandscape(
                     "[${Clock.System.now()}] [LOAD] Waited ${waitedMs}ms for carousel incoming cover (loaded=${incomingCover.isLoaded})"
                 )
 
-                val exitTarget = if (direction == TrackTransitionDirection.Forward) CoverSlotTarget.EXIT_LEFT else CoverSlotTarget.EXIT_RIGHT
-                coroutineScope {
-                    launch {
-                        animateCoverToSlot(
-                            cover = outgoingCover,
-                            target = exitTarget,
-                            durationMs = TRANSITION_MS,
-                            metrics = validMetrics,
-                        )
-                    }
-                    launch {
-                        animateCoverToSlot(
-                            cover = incomingCover,
-                            target = CoverSlotTarget.CENTER,
-                            durationMs = TRANSITION_MS,
-                            metrics = validMetrics,
-                        )
-                    }
-                }
-
-                activeCovers = listOf(incomingCover)
-                displayedArtworkUrl = currentThumbnailUrl
-                transitionState = ArtworkTransitionState.IDLE
+                transitionProgress.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(durationMillis = CAROUSEL_DURATION_MS, easing = LinearEasing),
+                )
+                completeTransition(incomingCover)
                 Logger.d(
                     "FullscreenLyrics",
-                    "[${Clock.System.now()}] [STATE] State transition: from=CAROUSEL, to=IDLE, reason=Carousel transition completed (trackId=$currentTrackId)"
+                    "[${Clock.System.now()}] [STATE] Carousel transition completed (trackId=$currentTrackId)"
                 )
             }
         }
@@ -1476,20 +1439,22 @@ private fun FullscreenLyricsLandscape(
                 contentAlignment = Alignment.Center,
             ) {
                 BoxWithConstraints {
-                    val artworkSize = minOf(maxWidth * 0.75f, maxHeight * 0.5f, LANDSCAPE_ARTWORK_MAX_SIZE)
-                    val handoffCoverSize = maxOf(0.dp, minOf(artworkSize * HANDOFF_SCALE, (maxWidth - HANDOFF_GAP) / 2))
-                    val effectiveHandoffScale = if (artworkSize > 0.dp) (handoffCoverSize / artworkSize).coerceIn(0.1f, 1f) else HANDOFF_SCALE
-                    val slotOffset = (handoffCoverSize + HANDOFF_GAP) / 2
-                    val slotOffsetPx = with(localDensity) { slotOffset.toPx() }
-                    val artworkWidthPx = with(localDensity) { artworkSize.toPx() }
-                    val carouselSlidePx = artworkWidthPx * TRACK_TRANSITION_SLIDE_FRACTION
-                    val exitDistancePx = artworkWidthPx * 0.35f
+                    val baseArtworkSize = minOf(maxWidth * 0.75f, maxHeight * 0.5f, LANDSCAPE_ARTWORK_MAX_SIZE)
+                    val expandedArtworkSize = maxOf(baseArtworkSize, minOf(maxWidth * 0.85f, maxHeight * 0.72f, 560.dp))
+                    val targetArtworkSize = if (showControlButtons) baseArtworkSize else expandedArtworkSize
+                    val currentArtworkSize by animateDpAsState(
+                        targetValue = targetArtworkSize,
+                        animationSpec = tween(durationMillis = 400, easing = FastOutSlowInEasing),
+                        label = "artworkSizeAnimation",
+                    )
+
+                    val artworkWidthPx = with(localDensity) { currentArtworkSize.toPx() }
+                    val slotOffsetPx = 0.75f * artworkWidthPx + with(localDensity) { HANDOFF_MIDPOINT_GAP.toPx() }
+                    val carouselSlidePx = slotOffsetPx
 
                     metricsHolder.metrics = ArtworkLayoutMetrics(
                         slotOffsetPx = slotOffsetPx,
-                        effectiveHandoffScale = effectiveHandoffScale,
                         carouselSlidePx = carouselSlidePx,
-                        exitDistancePx = exitDistancePx,
                     )
 
                     Column(
@@ -1497,18 +1462,19 @@ private fun FullscreenLyricsLandscape(
                             Modifier
                                 // Every style row carries its own 20dp side gutters, so a column
                                 // 40dp wider than the artwork lines the rows up with its edges.
-                                .width(artworkSize + 40.dp)
+                                .width(currentArtworkSize + 40.dp)
                                 // A short landscape window — a phone on its side — cannot fit the
                                 // artwork, the row and the transport at once. Scrolling keeps every
                                 // control full size where the column would otherwise squash the last.
                                 .verticalScroll(rememberScrollState()),
+                        horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        // 2D Mechanics for Artwork: Slide + Scale + Fade (Step 1)
+                        // 2D Mechanics for Artwork: Continuous Scale + Translation + Fade
                         Box(
                             modifier =
                                 Modifier
                                     .padding(horizontal = 20.dp)
-                                    .size(artworkSize),
+                                    .size(currentArtworkSize),
                             contentAlignment = Alignment.Center,
                         ) {
                             if (!transitionEnabled) {
@@ -1530,19 +1496,12 @@ private fun FullscreenLyricsLandscape(
                                     },
                                     modifier =
                                         Modifier
-                                            .size(artworkSize)
+                                            .size(currentArtworkSize)
                                             .clip(ArtworkShape),
                                 )
                             } else {
-                                val validMetrics = metricsHolder.metrics ?: ArtworkLayoutMetrics(
-                                    slotOffsetPx = 400f,
-                                    effectiveHandoffScale = HANDOFF_SCALE,
-                                    carouselSlidePx = 300f,
-                                    exitDistancePx = 300f,
-                                )
-
                                 @Composable
-                                fun RenderArtworkCover(cover: CoverItem) {
+                                fun RenderArtworkCover(cover: CoverItem, isOutgoing: Boolean) {
                                     key(cover.trackId) {
                                         AsyncImage(
                                             model =
@@ -1559,9 +1518,13 @@ private fun FullscreenLyricsLandscape(
                                             contentScale = ContentScale.Crop,
                                             onSuccess = {
                                                 cover.isLoaded = true
-                                                // Decision 5: Palette callback only from current track
-                                                if (cover.isCurrentTrack) {
-                                                    actions.onArtworkBitmap(it.result.image.toImageBitmap())
+                                                val bmp = it.result.image.toImageBitmap()
+                                                cover.bitmap = bmp
+                                                if (isFirstComposition || transitionState == ArtworkTransitionState.IDLE) {
+                                                    actions.onArtworkBitmap(bmp)
+                                                } else if (!isOutgoing && transitionProgress.value >= COVER_TRANSITION_PALETTE_TRIGGER_PROGRESS && !cover.isPaletteTriggered) {
+                                                    cover.isPaletteTriggered = true
+                                                    actions.onArtworkBitmap(bmp)
                                                 }
                                             },
                                             onError = {
@@ -1573,14 +1536,29 @@ private fun FullscreenLyricsLandscape(
                                             },
                                             modifier =
                                                 Modifier
-                                                    .size(artworkSize)
+                                                    .size(currentArtworkSize)
                                                     .graphicsLayer {
-                                                        translationX = cover.translationX.value
-                                                        scaleX = cover.scale.value
-                                                        scaleY = cover.scale.value
-                                                        rotationY = cover.rotationY.value
-                                                        cameraDistance = TRACK_TRANSITION_CAMERA_DISTANCE * density
-                                                        alpha = cover.alpha.value.coerceIn(0f, 1f)
+                                                        if (activeCovers.size >= 2 && transitionState != ArtworkTransitionState.IDLE) {
+                                                            val transform = mapCoverTransition(
+                                                                progress = transitionProgress.value,
+                                                                isOutgoing = isOutgoing,
+                                                                direction = transitionDirection,
+                                                                slotOffsetPx = slotOffsetPx,
+                                                            )
+                                                            translationX = transform.translationX
+                                                            scaleX = transform.scale
+                                                            scaleY = transform.scale
+                                                            rotationY = transform.rotationY
+                                                            cameraDistance = TRACK_TRANSITION_CAMERA_DISTANCE * density
+                                                            alpha = transform.alpha.coerceIn(0f, 1f)
+                                                        } else {
+                                                            translationX = 0f
+                                                            scaleX = 1f
+                                                            scaleY = 1f
+                                                            rotationY = 0f
+                                                            cameraDistance = TRACK_TRANSITION_CAMERA_DISTANCE * density
+                                                            alpha = 1f
+                                                        }
                                                         shape = ArtworkShape
                                                         clip = true
                                                     }
@@ -1591,35 +1569,39 @@ private fun FullscreenLyricsLandscape(
 
                                 if (activeCovers.size >= 2) {
                                     // Layer 1 (bottom): Outgoing cover
-                                    RenderArtworkCover(activeCovers[0])
+                                    RenderArtworkCover(activeCovers[0], isOutgoing = true)
 
                                     // Layer 2 (middle): Handoff particle canvas between the covers
+                                    val shouldRunParticleLoop = transitionEnabled && HANDOFF_PARTICLES_ENABLED &&
+                                        (transitionState == ArtworkTransitionState.HANDOFF || (transitionState == ArtworkTransitionState.SETTLING && particlePool.activeCount > 0))
+
                                     if (shouldRunParticleLoop || particlePool.activeCount > 0) {
                                         HandoffParticleCanvas(
                                             pool = particlePool,
-                                            metrics = validMetrics,
                                             boxSizePx = artworkWidthPx,
-                                            isSpawningAllowed = isSpawningAllowed,
+                                            outgoingRightRimX = {
+                                                val p = transitionProgress.value
+                                                val t = mapCoverTransition(p, isOutgoing = true, direction = transitionDirection, slotOffsetPx = slotOffsetPx)
+                                                t.translationX + (artworkWidthPx * t.scale) / 2f
+                                            },
+                                            incomingLeftRimX = {
+                                                val p = transitionProgress.value
+                                                val t = mapCoverTransition(p, isOutgoing = false, direction = transitionDirection, slotOffsetPx = slotOffsetPx)
+                                                t.translationX - (artworkWidthPx * t.scale) / 2f
+                                            },
+                                            isSpawningAllowed = {
+                                                transitionState == ArtworkTransitionState.HANDOFF &&
+                                                    transitionProgress.value in PARTICLE_SPAWN_PROGRESS_MIN..PARTICLE_SPAWN_PROGRESS_MAX
+                                            },
                                             isRunning = shouldRunParticleLoop,
-                                            modifier = Modifier.size(artworkSize),
+                                            modifier = Modifier.size(currentArtworkSize),
                                         )
                                     }
 
                                     // Layer 3 (top): Incoming cover
-                                    RenderArtworkCover(activeCovers[1])
+                                    RenderArtworkCover(activeCovers[1], isOutgoing = false)
                                 } else if (activeCovers.isNotEmpty()) {
-                                    // Lingering particle drain after settling
-                                    if (particlePool.activeCount > 0) {
-                                        HandoffParticleCanvas(
-                                            pool = particlePool,
-                                            metrics = validMetrics,
-                                            boxSizePx = artworkWidthPx,
-                                            isSpawningAllowed = false,
-                                            isRunning = shouldRunParticleLoop,
-                                            modifier = Modifier.size(artworkSize),
-                                        )
-                                    }
-                                    RenderArtworkCover(activeCovers[0])
+                                    RenderArtworkCover(activeCovers[0], isOutgoing = false)
                                 }
                             }
                         }
@@ -1636,35 +1618,45 @@ private fun FullscreenLyricsLandscape(
                                         // Shuffle and repeat live in the connected group on Now
                                         // Playing, which this page leaves out — so the transport
                                         // carries them here.
-                                        ExpressivePlaybackControls(
-                                            state = state,
-                                            actions = actions,
-                                            showShuffleAndRepeat = true,
-                                        )
+                                        AnimatedVisibility(
+                                            visible = showControlButtons,
+                                            enter = fadeIn(tween(300)) + expandVertically(tween(400, easing = FastOutSlowInEasing)),
+                                            exit = fadeOut(tween(250)) + shrinkVertically(tween(400, easing = FastOutSlowInEasing)),
+                                        ) {
+                                            Column(modifier = Modifier.fillMaxWidth()) {
+                                                ExpressivePlaybackControls(
+                                                    state = state,
+                                                    actions = actions,
+                                                    showShuffleAndRepeat = true,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
 
                             DataStoreManager.NOW_PLAYING_STYLE_APPLE_MUSIC -> {
                                 val typography = rememberAppleMusicTypography()
                                 AppleMusicMainTitleRow(state = state, actions = actions, typography = typography)
-                                Spacer(modifier = Modifier.height(16.dp))
-                                // The gutter and top inset AppleMusicBottomCluster gives these
-                                // controls on the Now Playing page; the controls leave both to
-                                // their Column.
-                                Column(
-                                    modifier =
-                                        Modifier
-                                            .padding(horizontal = 20.dp)
-                                            .padding(top = 8.dp),
+                                AnimatedVisibility(
+                                    visible = showControlButtons,
+                                    enter = fadeIn(tween(300)) + expandVertically(tween(400, easing = FastOutSlowInEasing)),
+                                    exit = fadeOut(tween(250)) + shrinkVertically(tween(400, easing = FastOutSlowInEasing)),
                                 ) {
-                                    // Apple's own desktop player puts shuffle and repeat at the
-                                    // two ends of this row; Now Playing keeps them in the queue.
-                                    AppleMusicPlaybackControls(
-                                        state = state,
-                                        actions = actions,
-                                        typography = typography,
-                                        showShuffleAndRepeat = true,
-                                    )
+                                    Column(
+                                        modifier =
+                                            Modifier
+                                                .padding(horizontal = 20.dp)
+                                                .padding(top = 16.dp),
+                                    ) {
+                                        // Apple's own desktop player puts shuffle and repeat at the
+                                        // two ends of this row; Now Playing keeps them in the queue.
+                                        AppleMusicPlaybackControls(
+                                            state = state,
+                                            actions = actions,
+                                            typography = typography,
+                                            showShuffleAndRepeat = true,
+                                        )
+                                    }
                                 }
                             }
 
@@ -1674,7 +1666,15 @@ private fun FullscreenLyricsLandscape(
                                     actions = actions,
                                     showCanvasThumbnail = false,
                                 )
-                                SpotifyPlaybackControls(state = state, actions = actions)
+                                AnimatedVisibility(
+                                    visible = showControlButtons,
+                                    enter = fadeIn(tween(300)) + expandVertically(tween(400, easing = FastOutSlowInEasing)),
+                                    exit = fadeOut(tween(250)) + shrinkVertically(tween(400, easing = FastOutSlowInEasing)),
+                                ) {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        SpotifyPlaybackControls(state = state, actions = actions)
+                                    }
+                                }
                             }
                         }
                     }

@@ -1911,51 +1911,52 @@ internal fun NowPlayingTrackInfoRow(
                 }
             }
         }
-        if (state.isUserLoggedIn) {
-            Spacer(modifier = Modifier.size(16.dp))
-            Crossfade(
-                targetState = state.likeStatus,
-            ) {
-                if (it) {
-                    IconButton(
-                        modifier =
-                            Modifier
-                                .size(24.dp)
-                                .aspectRatio(1f)
-                                .clip(
-                                    CircleShape,
-                                ),
-                        onClick = {
-                            actions.onAddToYouTubeLiked()
-                        },
-                    ) {
-                        Icon(imageVector = SimpIcons.CheckCircle, tint = Color.White, contentDescription = "")
-                    }
-                } else {
-                    IconButton(
-                        modifier =
-                            Modifier
-                                .size(24.dp)
-                                .aspectRatio(1f)
-                                .clip(
-                                    CircleShape,
-                                ),
-                        onClick = {
-                            actions.onAddToYouTubeLiked()
-                        },
-                    ) {
-                        Icon(
-                            imageVector = SimpIcons.AddCircleOutline,
-                            tint = Color.White,
-                            contentDescription = "",
-                        )
+        // ── Actions (Favorite & Add-to-Playlist) in a dedicated action area with 16dp spacing ──
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier.padding(start = 16.dp),
+        ) {
+            if (state.isUserLoggedIn) {
+                Crossfade(
+                    targetState = state.likeStatus,
+                ) {
+                    if (it) {
+                        IconButton(
+                            modifier =
+                                Modifier
+                                    .size(28.dp)
+                                    .aspectRatio(1f)
+                                    .clip(CircleShape),
+                            onClick = {
+                                actions.onAddToYouTubeLiked()
+                            },
+                        ) {
+                            Icon(imageVector = SimpIcons.CheckCircle, tint = Color.White, contentDescription = "Remove from YouTube Liked Songs")
+                        }
+                    } else {
+                        IconButton(
+                            modifier =
+                                Modifier
+                                    .size(28.dp)
+                                    .aspectRatio(1f)
+                                    .clip(CircleShape),
+                            onClick = {
+                                actions.onAddToYouTubeLiked()
+                            },
+                        ) {
+                            Icon(
+                                imageVector = SimpIcons.AddCircleOutline,
+                                tint = Color.White,
+                                contentDescription = "Save to YouTube Liked Songs",
+                            )
+                        }
                     }
                 }
             }
-        }
-        Spacer(modifier = Modifier.size(12.dp))
-        HeartCheckBox(checked = state.controllerState.isLiked, size = 32) {
-            actions.onUIEvent(UIEvent.ToggleLike)
+            HeartCheckBox(checked = state.controllerState.isLiked, size = 32) {
+                actions.onUIEvent(UIEvent.ToggleLike)
+            }
         }
     }
 }
@@ -2169,7 +2170,7 @@ internal fun ColumnScope.SpotifyPlaybackControls(
         modifier =
             Modifier
                 .fillMaxWidth()
-                .height(5.dp),
+                .height(14.dp),
     )
     // Control Button Layout
     PlayerControlLayout(

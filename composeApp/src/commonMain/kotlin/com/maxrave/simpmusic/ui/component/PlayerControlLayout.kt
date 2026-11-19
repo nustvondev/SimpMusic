@@ -53,10 +53,11 @@ fun PlayerControlLayout(
     contentColor: Color = Color.White,
     onUIEvent: (UIEvent) -> Unit,
 ) = LeftToRight {
-    val height = if (isSmallSize) 48.dp else 96.dp
-    val smallIcon = if (isSmallSize) 20.dp to 28.dp else 32.dp to 42.dp
-    val mediumIcon = if (isSmallSize) 28.dp to 38.dp else 42.dp to 52.dp
-    val bigIcon = if (isSmallSize) 38.dp to 48.dp else 72.dp to 96.dp
+    // Balanced visual hierarchy: Play/Pause is primary (1.3x ratio), other controls are uniformly sized
+    val height = if (isSmallSize) 44.dp else 68.dp
+    val smallIcon = if (isSmallSize) 20.dp to 32.dp else 26.dp to 44.dp
+    val mediumIcon = if (isSmallSize) 22.dp to 34.dp else 28.dp to 46.dp
+    val bigIcon = if (isSmallSize) 28.dp to 42.dp else 38.dp to 58.dp // ~1.3x scale
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -66,145 +67,119 @@ fun PlayerControlLayout(
                 .height(height)
                 .padding(horizontal = horizontalPadding),
     ) {
+        // ── 1. Shuffle Button ──
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             Box(
                 modifier =
                     Modifier
-                        .background(Color.Transparent)
                         .size(smallIcon.second)
                         .aspectRatio(1f)
-                        .clip(
-                            CircleShape,
-                        )
+                        .clip(CircleShape)
                         .clickable {
                             onUIEvent(UIEvent.Shuffle)
                         },
                 contentAlignment = Alignment.Center,
             ) {
                 Crossfade(targetState = controllerState.isShuffle, label = "Shuffle Button") { isShuffle ->
-                    if (!isShuffle) {
-                        Icon(
-                            imageVector = SimpIcons.Shuffle,
-                            tint = contentColor,
-                            contentDescription = "",
-                            modifier = Modifier.size(smallIcon.first),
-                        )
-                    } else {
-                        Icon(
-                            imageVector = SimpIcons.Shuffle,
-                            tint = activeColor,
-                            contentDescription = "",
-                            modifier = Modifier.size(smallIcon.first),
-                        )
-                    }
+                    Icon(
+                        imageVector = SimpIcons.Shuffle,
+                        tint = if (isShuffle) activeColor else contentColor.copy(alpha = 0.85f),
+                        contentDescription = if (isShuffle) "Disable Shuffle" else "Enable Shuffle",
+                        modifier = Modifier.size(smallIcon.first),
+                    )
                 }
             }
         }
+        // ── 2. Previous Track Button ──
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             Box(
                 modifier =
                     Modifier
-                        .background(Color.Transparent)
                         .size(mediumIcon.second)
                         .aspectRatio(1f)
-                        .clip(
-                            CircleShape,
-                        )
-                        .clickable {
-                            if (controllerState.isPreviousAvailable) {
-                                onUIEvent(UIEvent.Previous)
-                            }
+                        .clip(CircleShape)
+                        .clickable(enabled = controllerState.isPreviousAvailable) {
+                            onUIEvent(UIEvent.Previous)
                         },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = SimpIcons.SkipPrevious,
-                    tint = if (controllerState.isPreviousAvailable) contentColor else contentColor.copy(alpha = 0.4f),
-                    contentDescription = "",
+                    tint = if (controllerState.isPreviousAvailable) contentColor else contentColor.copy(alpha = 0.38f),
+                    contentDescription = "Previous Track",
                     modifier = Modifier.size(mediumIcon.first),
                 )
             }
         }
-        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+        // ── 3. Primary Play / Pause Button (~1.3x scale) ──
+        Box(Modifier.weight(1.15f), contentAlignment = Alignment.Center) {
             Box(
                 modifier =
                     Modifier
-                        .background(Color.Transparent)
                         .size(bigIcon.second)
                         .aspectRatio(1f)
-                        .clip(
-                            CircleShape,
-                        )
+                        .clip(CircleShape)
                         .clickable {
                             onUIEvent(UIEvent.PlayPause)
                         },
                 contentAlignment = Alignment.Center,
             ) {
-                Crossfade(targetState = controllerState.isPlaying) { isPlaying ->
-                    if (!isPlaying) {
-                        Icon(
-                            imageVector = if (plainPlayPause) SimpIcons.PlayArrow else SimpIcons.PlayCircle,
-                            tint = contentColor,
-                            contentDescription = "",
-                            modifier = Modifier.size(bigIcon.first),
-                        )
-                    } else {
-                        Icon(
-                            imageVector = if (plainPlayPause) SimpIcons.Pause else SimpIcons.PauseCircle,
-                            tint = contentColor,
-                            contentDescription = "",
-                            modifier = Modifier.size(bigIcon.first),
-                        )
-                    }
+                Crossfade(targetState = controllerState.isPlaying, label = "PlayPause Button") { isPlaying ->
+                    Icon(
+                        imageVector =
+                            if (plainPlayPause) {
+                                if (isPlaying) SimpIcons.Pause else SimpIcons.PlayArrow
+                            } else {
+                                if (isPlaying) SimpIcons.PauseCircle else SimpIcons.PlayCircle
+                            },
+                        tint = contentColor,
+                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        modifier = Modifier.size(bigIcon.first),
+                    )
                 }
             }
         }
+        // ── 4. Next Track Button ──
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             Box(
                 modifier =
                     Modifier
-                        .background(Color.Transparent)
                         .size(mediumIcon.second)
                         .aspectRatio(1f)
-                        .clip(
-                            CircleShape,
-                        )
-                        .clickable {
-                            if (controllerState.isNextAvailable) {
-                                onUIEvent(UIEvent.Next)
-                            }
+                        .clip(CircleShape)
+                        .clickable(enabled = controllerState.isNextAvailable) {
+                            onUIEvent(UIEvent.Next)
                         },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = SimpIcons.SkipNext,
-                    tint = if (controllerState.isNextAvailable) contentColor else contentColor.copy(alpha = 0.4f),
-                    contentDescription = "",
+                    tint = if (controllerState.isNextAvailable) contentColor else contentColor.copy(alpha = 0.38f),
+                    contentDescription = "Next Track",
                     modifier = Modifier.size(mediumIcon.first),
                 )
             }
         }
+        // ── 5. Repeat Button ──
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
             Box(
                 modifier =
                     Modifier
                         .size(smallIcon.second)
                         .aspectRatio(1f)
-                        .clip(
-                            CircleShape,
-                        )
+                        .clip(CircleShape)
                         .clickable {
                             onUIEvent(UIEvent.Repeat)
                         },
                 contentAlignment = Alignment.Center,
             ) {
-                Crossfade(targetState = controllerState.repeatState) { rs ->
+                Crossfade(targetState = controllerState.repeatState, label = "Repeat Button") { rs ->
                     when (rs) {
                         is RepeatState.None -> {
                             Icon(
                                 imageVector = SimpIcons.Repeat,
-                                tint = contentColor,
-                                contentDescription = "",
+                                tint = contentColor.copy(alpha = 0.85f),
+                                contentDescription = "Enable Repeat All",
                                 modifier = Modifier.size(smallIcon.first),
                             )
                         }
@@ -213,7 +188,7 @@ fun PlayerControlLayout(
                             Icon(
                                 imageVector = SimpIcons.Repeat,
                                 tint = activeColor,
-                                contentDescription = "",
+                                contentDescription = "Repeat One Track",
                                 modifier = Modifier.size(smallIcon.first),
                             )
                         }
@@ -222,7 +197,7 @@ fun PlayerControlLayout(
                             Icon(
                                 imageVector = SimpIcons.RepeatOne,
                                 tint = activeColor,
-                                contentDescription = "",
+                                contentDescription = "Disable Repeat",
                                 modifier = Modifier.size(smallIcon.first),
                             )
                         }

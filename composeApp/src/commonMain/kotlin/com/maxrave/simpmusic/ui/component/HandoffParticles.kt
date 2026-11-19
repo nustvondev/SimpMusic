@@ -52,29 +52,22 @@ internal class HandoffParticlePool(
     fun update(
         dtMs: Float,
         isSpawningAllowed: Boolean,
-        metrics: ArtworkLayoutMetrics,
-        boxWidth: Float,
-        boxHeight: Float,
+        outRightRimX: Float,
+        inLeftRimX: Float,
+        boxCenterY: Float,
+        coverHeight: Float,
     ) {
-        val boxCenterX = boxWidth / 2f
-        val boxCenterY = boxHeight / 2f
-        val effectiveScale = metrics.effectiveHandoffScale
-        val coverWidth = boxWidth * effectiveScale
-        val coverHeight = boxHeight * effectiveScale
-        val gapPx = metrics.slotOffsetPx * 2f - coverWidth
-
-        // Spawning: only when allowed and below max capacity
-        if (isSpawningAllowed) {
+        // Spawning: only when allowed, gap is positive, and below max capacity
+        if (isSpawningAllowed && inLeftRimX > outRightRimX) {
             timeSinceLastSpawnMs += dtMs
             while (timeSinceLastSpawnMs >= SPAWN_INTERVAL_MS) {
                 timeSinceLastSpawnMs -= SPAWN_INTERVAL_MS
                 if (activeCount < maxParticles) {
                     spawnOne(
-                        boxCenterX = boxCenterX,
+                        outRightRimX = outRightRimX,
+                        inLeftRimX = inLeftRimX,
                         boxCenterY = boxCenterY,
-                        coverWidth = coverWidth,
                         coverHeight = coverHeight,
-                        gapPx = gapPx,
                     )
                 }
             }
@@ -97,6 +90,8 @@ internal class HandoffParticlePool(
                     state[base + OFF_ACTIVE] = 0f
                 } else {
                     state[base + OFF_PROGRESS] = progress
+                    // Dynamically converge particle destination toward current incoming rim
+                    state[base + OFF_END_X] = inLeftRimX
                     currentActive++
                 }
             }
@@ -105,11 +100,10 @@ internal class HandoffParticlePool(
     }
 
     private fun spawnOne(
-        boxCenterX: Float,
+        outRightRimX: Float,
+        inLeftRimX: Float,
         boxCenterY: Float,
-        coverWidth: Float,
         coverHeight: Float,
-        gapPx: Float,
     ) {
         // Find an inactive slot
         for (i in 0 until maxParticles) {
@@ -120,11 +114,9 @@ internal class HandoffParticlePool(
                 state[base + OFF_PROGRESS] = 0f
                 state[base + OFF_LIFETIME] = (PARTICLE_LIFETIME_MIN_MS + Random.nextFloat() * (PARTICLE_LIFETIME_MAX_MS - PARTICLE_LIFETIME_MIN_MS)).toFloat()
 
-                // Spawn near right rim of outgoing cover, flow toward left rim of incoming cover
-                val rightRimX = boxCenterX - gapPx / 2f
-                val leftRimX = boxCenterX + gapPx / 2f
-                state[base + OFF_START_X] = rightRimX - Random.nextFloat() * (coverWidth * 0.12f)
-                state[base + OFF_END_X] = leftRimX + Random.nextFloat() * (coverWidth * 0.12f)
+                // Spawn at actual right rim of outgoing cover, flow toward left rim of incoming cover
+                state[base + OFF_START_X] = outRightRimX - Random.nextFloat() * 8f
+                state[base + OFF_END_X] = inLeftRimX + Random.nextFloat() * 8f
 
                 // Vertical distribution across the center 70% of the artwork height
                 val startY = boxCenterY + (Random.nextFloat() - 0.5f) * (coverHeight * 0.70f)
@@ -215,15 +207,16 @@ internal class HandoffParticlePool(
 @Composable
 internal fun HandoffParticleCanvas(
     pool: HandoffParticlePool,
-    metrics: ArtworkLayoutMetrics,
     boxSizePx: Float,
-    isSpawningAllowed: Boolean,
+    outgoingRightRimX: () -> Float,
+    incomingLeftRimX: () -> Float,
+    isSpawningAllowed: () -> Boolean,
     isRunning: Boolean,
     modifier: Modifier = Modifier,
 ) {
     var frameClock by remember { mutableLongStateOf(0L) }
 
-    LaunchedEffect(isRunning, isSpawningAllowed) {
+    LaunchedEffect(isRunning) {
         if (!isRunning) return@LaunchedEffect
 
         var lastFrameNanos = 0L
@@ -233,10 +226,11 @@ internal fun HandoffParticleCanvas(
                     val dtMs = ((frameTimeNanos - lastFrameNanos) / 1_000_000f).coerceIn(1f, 50f)
                     pool.update(
                         dtMs = dtMs,
-                        isSpawningAllowed = isSpawningAllowed,
-                        metrics = metrics,
-                        boxWidth = boxSizePx,
-                        boxHeight = boxSizePx,
+                        isSpawningAllowed = isSpawningAllowed(),
+                        outRightRimX = outgoingRightRimX(),
+                        inLeftRimX = incomingLeftRimX(),
+                        boxCenterY = boxSizePx / 2f,
+                        coverHeight = boxSizePx,
                     )
                 }
                 lastFrameNanos = frameTimeNanos
